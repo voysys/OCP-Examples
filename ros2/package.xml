@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ocp_vehicle_example</name>
+  <version>0.1.0</version>
+  <description>Vehicle-side OCP TCP client and ROS 2 Joy publisher</description>
+  <maintainer email="support@voysys.se">Voysys AB</maintainer>
+  <license>0BSD</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>nlohmann-json-dev</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
