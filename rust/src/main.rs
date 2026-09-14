@@ -23,6 +23,10 @@ use crate::{
 mod error;
 mod protocol;
 
+const DEFAULT_ADDRESS: &str = "127.0.0.1:4000";
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_MESSAGE_SIZE: u32 = 16 * 1024;
+
 #[derive(Default)]
 struct TimeStamp {
     ack_time: u64,
@@ -31,27 +35,76 @@ struct TimeStamp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_ADDRESS.to_string());
+    if !valid_address(&addr) {
+        let program = std::env::args().next().unwrap_or_default();
+        eprintln!("Usage: {program} [host:port]  (default {DEFAULT_ADDRESS})");
+        std::process::exit(1);
+    }
+
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
 
+    let mut last_connect_status = String::new();
+    let mut last_end_status = String::new();
+
     loop {
-        match TcpStream::connect("127.0.0.1:4000").await {
+        match TcpStream::connect(&addr).await {
             Ok(stream) => {
-                if let Err(e) = handle_stream(stream, &tx).await {
-                    println!("Error: {e}");
-                };
+                print_if_changed(
+                    &mut last_connect_status,
+                    format!("TCP connection established to {addr}, waiting for OCP data..."),
+                );
+                match handle_stream(stream, &tx, &addr).await {
+                    Ok(()) => {
+                        print_if_changed(&mut last_end_status, format!("Disconnected from {addr}"))
+                    }
+                    Err(OcpError::Other(reason)) => print_if_changed(&mut last_end_status, reason),
+                    Err(e) => print_if_changed(
+                        &mut last_end_status,
+                        format!("Disconnected from {addr}: {e}"),
+                    ),
+                }
             }
-            Err(e) => println!("Error: {e}"),
+            Err(e) => print_if_changed(
+                &mut last_connect_status,
+                format!(
+                    "Failed to connect to OCP at {addr}: {e}. Is the Oden Streamer running with the OCP plugin enabled?"
+                ),
+            ),
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
+fn valid_address(addr: &str) -> bool {
+    if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+        return socket_addr.port() != 0;
+    }
+
+    addr.rsplit_once(':').is_some_and(|(host, port)| {
+        !host.is_empty()
+            && !host.contains(':')
+            && port
+                .parse::<u16>()
+                .is_ok_and(|parsed_port| parsed_port != 0)
+    })
+}
+
+fn print_if_changed(last: &mut String, status: String) {
+    if *last != status {
+        println!("{status}");
+        *last = status;
+    }
+}
+
 async fn handle_stream(
     stream: TcpStream,
     tx: &Sender<VehicleControlMessage>,
+    addr: &str,
 ) -> Result<(), OcpError> {
-    println!("Connected to Oden Streamer");
     let (reader, writer) = stream.into_split();
     let (done_tx, mut done_rx) = oneshot::channel();
     let timestamp = Arc::new(Mutex::new(TimeStamp::default()));
@@ -59,8 +112,9 @@ async fn handle_stream(
     let tx = tx.clone();
     let read_task = tokio::spawn({
         let timestamp = timestamp.clone();
+        let addr = addr.to_string();
         async move {
-            let res = read_message(reader, tx, timestamp).await;
+            let res = read_message(reader, tx, timestamp, &addr).await;
             done_tx.send(res)
         }
     });
@@ -68,35 +122,72 @@ async fn handle_stream(
     let res = tokio::select! {
         biased;
         res = &mut done_rx => {
-            res.unwrap_or(Ok(()))
+            res.unwrap_or_else(|_| {
+                Err(OcpError::Other("read task terminated unexpectedly".to_string()))
+            })
         }
         res = write_message(writer, timestamp) => {res}
     };
 
     read_task.abort();
 
-    if let Err(e) = res {
-        return match e {
-            OcpError::Io(_) => Ok(()),
-            _ => Err(e),
-        };
-    }
-
-    Ok(())
+    res
 }
 
 async fn read_message(
     mut reader: OwnedReadHalf,
     tx: Sender<VehicleControlMessage>,
     timestamps: Arc<Mutex<TimeStamp>>,
+    addr: &str,
 ) -> Result<(), OcpError> {
+    let mut first_message = true;
+
     loop {
-        let length = reader.read_u32_le().await?;
+        let length = tokio::time::timeout(READ_TIMEOUT, reader.read_u32_le())
+            .await
+            .map_err(|_| {
+                OcpError::Other(if first_message {
+                    format!(
+                        "Connected to {addr} but received no OCP data within 2s - another application may be listening on this port instead of OCP."
+                    )
+                } else {
+                    "Connection to OCP timed out (no data in 2s)".to_string()
+                })
+            })??;
+
+        if length > MAX_MESSAGE_SIZE {
+            return Err(OcpError::Other(format!(
+                "Received an invalid frame (length {length} bytes, max {MAX_MESSAGE_SIZE}) from {addr} - the service on this port does not appear to be OCP."
+            )));
+        }
 
         let mut buf: Vec<u8> = vec![0; length as usize];
-        reader.read_exact(buf.as_mut_slice()).await?;
+        tokio::time::timeout(READ_TIMEOUT, reader.read_exact(buf.as_mut_slice()))
+            .await
+            .map_err(|_| {
+                OcpError::Other(if first_message {
+                    format!(
+                        "Connected to {addr} but did not receive a complete OCP message within 2s - another application may be listening on this port instead of OCP."
+                    )
+                } else {
+                    "Connection to OCP timed out (incomplete message)".to_string()
+                })
+            })??;
 
-        let res: VehicleControlMessage = serde_json::from_slice(buf.as_slice())?;
+        let res: VehicleControlMessage = match serde_json::from_slice(buf.as_slice()) {
+            Ok(res) => res,
+            Err(_) if first_message => {
+                return Err(OcpError::Other(format!(
+                    "Data from {addr} does not match the OCP protocol - another application may be listening on this port instead of OCP."
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        if first_message {
+            first_message = false;
+            println!("Connected to Oden Streamer at {addr}");
+        }
 
         println!("{:#?}", res);
 

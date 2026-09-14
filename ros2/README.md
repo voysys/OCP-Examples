@@ -23,6 +23,12 @@ cmake --build build
 ./build/OcpVehicleExample
 ```
 
+The OCP address is configurable through node parameters (defaults shown):
+
+```shell
+./build/OcpVehicleExample --ros-args -p address:=127.0.0.1 -p port:=4000
+```
+
 ## Topic commands
 
 ```shell

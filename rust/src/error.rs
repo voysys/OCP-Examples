@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: 0BSD
 
 use std::io;
-use tokio::sync::mpsc;
-
-use crate::protocol::VehicleControlMessage;
 
 #[allow(clippy::enum_variant_names)]
 #[derive(thiserror::Error, Debug)]
@@ -13,8 +10,6 @@ pub enum OcpError {
     Io(#[from] io::Error),
     #[error("Serde Json Error: `{0}`")]
     SerdeJson(#[from] serde_json::Error),
-    #[error("MPSC Error: `{0}`")]
-    Mpcs(#[from] mpsc::error::SendError<VehicleControlMessage>),
     #[error("Other Error: `{0}`")]
     Other(String),
 }

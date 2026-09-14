@@ -15,4 +15,11 @@ automatically.
 cargo run --release
 ```
 
+By default the client connects to `127.0.0.1:4000`. A different address can be
+given as the first argument:
+
+```shell
+cargo run --release -- 127.0.0.1:5000
+```
+
 Requires a Rust toolchain with edition 2024 support.

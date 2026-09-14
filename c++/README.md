@@ -9,9 +9,16 @@ The client accepts optional controller and user-data fields, echoes the latest
 acknowledgement values, sends the same example telemetry as the Rust client
 every 10 ms, and reconnects after 100 ms when a connection ends.
 
-## Build
+## Build and run
 
 ```shell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
+```
+
+By default the client connects to `127.0.0.1:4000`. A different address can be
+given as the first argument:
+
+```shell
+./OcpVehicleExample 127.0.0.1:5000
 ```

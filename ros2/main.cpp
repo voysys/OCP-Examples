@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -21,10 +22,12 @@
 
 using json = nlohmann::json;
 
-constexpr const char * SERVER_IP = "127.0.0.1";
-constexpr int PORT = 4000;
+constexpr const char * DEFAULT_ADDRESS = "127.0.0.1";
+constexpr int DEFAULT_PORT = 4000;
 constexpr size_t LENGTH_HEADER_SIZE = 4;
+constexpr uint32_t MAX_MESSAGE_SIZE = 16 * 1024;
 constexpr auto SOCKET_TIMEOUT = std::chrono::milliseconds(100);
+constexpr auto READ_TIMEOUT = std::chrono::seconds(2);
 constexpr auto RECONNECT_DELAY = std::chrono::milliseconds(100);
 constexpr auto RESPONSE_INTERVAL = std::chrono::milliseconds(10);
 
@@ -32,6 +35,8 @@ struct AckTimes {
     uint64_t ack_time = 0;
     uint32_t ack_time_mac = 0;
 };
+
+enum class RecvStatus { Ok, Closed, TimedOut };
 
 static uint32_t read_u32_le(const char * buffer) {
     return static_cast<uint32_t>(static_cast<uint8_t>(buffer[0])) |
@@ -60,6 +65,9 @@ static bool set_socket_timeouts(int sock) {
 class OcpVehicleExample: public rclcpp::Node {
 public:
     OcpVehicleExample() : Node("ocp_vehicle_example") {
+        address = declare_parameter<std::string>("address", DEFAULT_ADDRESS);
+        port = static_cast<int>(declare_parameter<int>("port", DEFAULT_PORT));
+
         auto qos = rclcpp::SensorDataQoS();
         qos.keep_last(2);
         qos.reliable();
@@ -91,18 +99,45 @@ private:
                 continue;
             }
 
+            if (port <= 0 || port > 65535) {
+                RCLCPP_FATAL(get_logger(), "Invalid port parameter %d (expected 1-65535).", port);
+                close(sock);
+                rclcpp::shutdown();
+                return;
+            }
+
             sockaddr_in servAddr = {};
             servAddr.sin_family = AF_INET;
-            servAddr.sin_port = htons(PORT);
-            inet_pton(AF_INET, SERVER_IP, &servAddr.sin_addr);
+            servAddr.sin_port = htons(static_cast<uint16_t>(port));
+            if (inet_pton(AF_INET, address.c_str(), &servAddr.sin_addr) != 1) {
+                RCLCPP_FATAL(get_logger(), "Invalid address parameter '%s'.", address.c_str());
+                close(sock);
+                rclcpp::shutdown();
+                return;
+            }
 
             if (connect(sock, reinterpret_cast<sockaddr *>(&servAddr), sizeof(servAddr)) != 0) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(),
+                    *get_clock(),
+                    5000,
+                    "Failed to connect to OCP at %s:%d: %s. Is the Oden Streamer running with the "
+                    "OCP plugin enabled?",
+                    address.c_str(),
+                    port,
+                    strerror(errno));
                 close(sock);
                 std::this_thread::sleep_for(RECONNECT_DELAY);
                 continue;
             }
 
-            RCLCPP_INFO(get_logger(), "Connected to the Oden OCP ECU.");
+            RCLCPP_INFO_THROTTLE(
+                get_logger(),
+                *get_clock(),
+                5000,
+                "TCP connection established to %s:%d, waiting for OCP data...",
+                address.c_str(),
+                port);
 
             {
                 std::scoped_lock lock(ackMutex);
@@ -115,29 +150,95 @@ private:
             writeThread.join();
 
             close(sock);
-            RCLCPP_INFO(get_logger(), "Disconnected from the Oden OCP ECU.");
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000, "Disconnected from the Oden OCP ECU.");
             publish_neutral_joy();
             std::this_thread::sleep_for(RECONNECT_DELAY);
         }
     }
 
     void read_loop(int sock) {
+        bool firstMessage = true;
+
         while (connection_running()) {
+            const auto deadline = std::chrono::steady_clock::now() + READ_TIMEOUT;
+
             char lengthBuffer[LENGTH_HEADER_SIZE];
-            if (!recv_all(sock, lengthBuffer, LENGTH_HEADER_SIZE)) {
+            RecvStatus status = recv_all(sock, lengthBuffer, LENGTH_HEADER_SIZE, deadline);
+            if (status != RecvStatus::Ok) {
+                if (status == RecvStatus::TimedOut) {
+                    if (firstMessage) {
+                        RCLCPP_ERROR_THROTTLE(
+                            get_logger(),
+                            *get_clock(),
+                            5000,
+                            "Connected to %s:%d but received no OCP data within 2s - another "
+                            "application may be listening on this port instead of OCP.",
+                            address.c_str(),
+                            port);
+                    } else {
+                        RCLCPP_ERROR(get_logger(), "Connection to OCP timed out (no data in 2s)");
+                    }
+                }
+                break;
+            }
+
+            const uint32_t length = read_u32_le(lengthBuffer);
+            if (length > MAX_MESSAGE_SIZE) {
+                RCLCPP_ERROR_THROTTLE(
+                    get_logger(),
+                    *get_clock(),
+                    5000,
+                    "Received an invalid frame (length %u bytes, max %u) from %s:%d - the service "
+                    "on this port does not appear to be OCP.",
+                    length,
+                    MAX_MESSAGE_SIZE,
+                    address.c_str(),
+                    port);
+                break;
+            }
+
+            std::string payload(length, '\0');
+            status = recv_all(sock, payload.data(), payload.size(), deadline);
+            if (status != RecvStatus::Ok) {
+                if (status == RecvStatus::TimedOut) {
+                    if (firstMessage) {
+                        RCLCPP_ERROR_THROTTLE(
+                            get_logger(),
+                            *get_clock(),
+                            5000,
+                            "Connected to %s:%d but did not receive a complete OCP message within "
+                            "2s - another application may be listening on this port instead of OCP.",
+                            address.c_str(),
+                            port);
+                    } else {
+                        RCLCPP_ERROR(get_logger(), "Connection to OCP timed out (incomplete message)");
+                    }
+                }
                 break;
             }
 
             OCP::VehicleControlMessage message;
             try {
-                std::string payload(read_u32_le(lengthBuffer), '\0');
-                if (!recv_all(sock, payload.data(), payload.size())) {
-                    break;
-                }
                 message = json::parse(payload).get<OCP::VehicleControlMessage>();
             } catch (const std::exception & error) {
-                RCLCPP_ERROR(get_logger(), "Invalid OCP message: %s", error.what());
+                if (firstMessage) {
+                    RCLCPP_ERROR_THROTTLE(
+                        get_logger(),
+                        *get_clock(),
+                        5000,
+                        "Data from %s:%d does not match the OCP protocol - another application may "
+                        "be listening on this port instead of OCP.",
+                        address.c_str(),
+                        port);
+                } else {
+                    RCLCPP_ERROR(get_logger(), "Invalid OCP message: %s", error.what());
+                }
                 break;
+            }
+
+            if (firstMessage) {
+                firstMessage = false;
+                RCLCPP_INFO(get_logger(), "Connected to the Oden OCP ECU.");
             }
 
             {
@@ -194,19 +295,26 @@ private:
         connRun.store(false);
     }
 
-    bool recv_all(int sock, char * buffer, size_t length) {
+    RecvStatus recv_all(
+        int sock, char * buffer, size_t length, std::chrono::steady_clock::time_point deadline) {
         size_t total = 0;
         while (total < length) {
             ssize_t result = recv(sock, buffer + total, length - total, 0);
             if (result > 0) {
                 total += static_cast<size_t>(result);
-            } else if (
-                result == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) ||
-                !connection_running()) {
-                return false;
+                continue;
+            }
+            if (result == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                return RecvStatus::Closed;
+            }
+            if (!connection_running()) {
+                return RecvStatus::Closed;
+            }
+            if (std::chrono::steady_clock::now() > deadline) {
+                return RecvStatus::TimedOut;
             }
         }
-        return true;
+        return RecvStatus::Ok;
     }
 
     bool send_all(int sock, const char * buffer, size_t length) {
@@ -252,6 +360,8 @@ private:
     std::thread clientThread;
     std::mutex ackMutex;
     AckTimes acks;
+    std::string address;
+    int port = 0;
     std::atomic_bool stopped = false;
     std::atomic_bool connRun = false;
 };
