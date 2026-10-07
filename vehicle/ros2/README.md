@@ -16,7 +16,7 @@ sudo apt install nlohmann-json3-dev
 ## Build and run
 
 ```shell
-cd plugins/ocp_vehicle_example/ros2
+cd vehicle/ros2
 source /opt/ros/<distro>/setup.bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
